@@ -21,6 +21,7 @@ import json
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -28,8 +29,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 MODEL_AGENT = "sonnet"   # generates agent responses
-MODEL_JUDGE = "sonnet"   # judges responses (PASS/FAIL only)
-BATCH_SIZE = 2           # cases per batch (10 cases / 5 batches)
+MODEL_JUDGE = "haiku"    # fast judge for PASS/FAIL (trivial task)
+BATCH_SIZE = 4           # cases per batch (10 cases / 5 batches)
 BATCH_RESULTS_DIR = Path(__file__).parent / "batch_results"
 
 # Binary evaluation criteria (pass/fail)
@@ -76,7 +77,7 @@ def claude_cli(prompt: str, system_prompt: str | None = None, model: str = "haik
         cmd,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=300,
     )
 
     if result.returncode != 0:
@@ -117,9 +118,14 @@ def get_agent_response(prompt: str, case: dict) -> tuple[str, dict]:
     """Send a test case to the agent. Returns (response_text, token_usage)."""
     return claude_cli(case["input"], system_prompt=prompt, model=MODEL_AGENT)
 
-def judge_response(case: dict, response: str, criterion: dict) -> tuple[bool, dict]:
-    """Use Claude as judge. Returns (passed, token_usage)."""
-    judge_prompt = f"""You are an impartial evaluator. Judge this AI agent response against one criterion.
+def judge_all_criteria(case: dict, response: str) -> tuple[dict[str, bool], dict]:
+    """Judge all 5 criteria in a single CLI call. Returns (criteria_results, token_usage)."""
+    criteria_block = "\n".join(
+        f"{i+1}. {c['id']}: {c['question']}"
+        for i, c in enumerate(CRITERIA)
+    )
+
+    judge_prompt = f"""You are an impartial evaluator. Judge this AI agent response against ALL criteria below.
 
 CONTEXT: {case['context']}
 USER INPUT: {case['input']}
@@ -127,12 +133,32 @@ USER INPUT: {case['input']}
 AGENT RESPONSE:
 {response}
 
-CRITERION: {criterion['question']}
+CRITERIA:
+{criteria_block}
 
-Answer ONLY "PASS" or "FAIL". Nothing else."""
+For each criterion, answer PASS or FAIL. Use this exact format (one per line):
+actionable: PASS
+concise: PASS
+persona: FAIL
+no_hedging: PASS
+ships_fast: PASS"""
 
     answer, tokens = claude_cli(judge_prompt, model=MODEL_JUDGE)
-    return "PASS" in answer.strip().upper(), tokens
+
+    # Parse results
+    results = {}
+    for criterion in CRITERIA:
+        cid = criterion["id"]
+        # Look for "cid: PASS" or "cid: FAIL" in the response
+        for line in answer.strip().split("\n"):
+            if cid in line.lower():
+                results[cid] = "PASS" in line.upper()
+                break
+        if cid not in results:
+            # Fallback: assume FAIL if not found
+            results[cid] = False
+
+    return results, tokens
 
 def add_tokens(totals: dict, usage: dict):
     """Accumulate token usage into totals dict."""
@@ -140,7 +166,7 @@ def add_tokens(totals: dict, usage: dict):
         totals[key] = totals.get(key, 0) + usage.get(key, 0)
 
 def get_batch_cases(cases: list[dict], batch_num: int) -> list[dict]:
-    """Get cases for a specific batch (1-indexed). 5 batches of 2."""
+    """Get cases for a specific batch (1-indexed)."""
     start = (batch_num - 1) * BATCH_SIZE
     end = start + BATCH_SIZE
     return cases[start:end]
@@ -152,10 +178,48 @@ def filter_cases_by_id(cases: list[dict], case_ids: list[str]) -> list[dict]:
 def empty_token_totals() -> dict:
     return {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0, "cost_usd": 0.0, "duration_ms": 0}
 
+def eval_single_case(prompt: str, case: dict, case_num: int, total: int, verbose: bool) -> tuple[dict, dict]:
+    """Evaluate a single case: get response + judge all criteria. Returns (case_results, case_tokens)."""
+    case_tokens = empty_token_totals()
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Case {case_num}/{total}: {case['id']}")
+        print(f"Input: {case['input'][:80]}...")
+
+    # Get agent response
+    response, agent_tokens = get_agent_response(prompt, case)
+    add_tokens(case_tokens, agent_tokens)
+
+    if verbose:
+        print(f"Response ({len(response.split())} words):")
+        print(f"  {response[:300]}...")
+        print(f"  tokens: in={agent_tokens['input_tokens']} out={agent_tokens['output_tokens']} cost=${agent_tokens['cost_usd']:.4f}")
+
+    # Judge all criteria in one call
+    criteria_results, judge_tokens = judge_all_criteria(case, response)
+    add_tokens(case_tokens, judge_tokens)
+
+    pass_count = sum(1 for v in criteria_results.values() if v)
+    case_results = {
+        "id": case["id"],
+        "criteria": criteria_results,
+        "pass_count": pass_count,
+        "token_usage": case_tokens,
+    }
+
+    if verbose:
+        for cid, passed in criteria_results.items():
+            status = "PASS" if passed else "FAIL"
+            print(f"  [{status}] {cid}")
+
+    return case_results, case_tokens
+
 def run_eval(cases: list[dict], verbose: bool = False) -> dict:
-    """Run evaluation on given cases. Returns results dict."""
+    """Run evaluation on given cases with parallel execution. Returns results dict."""
     prompt = load_prompt()
     total_tokens = empty_token_totals()
+    wall_start = time.time()
 
     results = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -172,50 +236,35 @@ def run_eval(cases: list[dict], verbose: bool = False) -> dict:
         "token_usage": {},
     }
 
-    for i, case in enumerate(cases):
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"Case {i+1}/{len(cases)}: {case['id']}")
-            print(f"Input: {case['input'][:80]}...")
+    # Run cases in parallel using ThreadPoolExecutor
+    case_results_map = {}
+    with ThreadPoolExecutor(max_workers=len(cases)) as executor:
+        futures = {
+            executor.submit(eval_single_case, prompt, case, i + 1, len(cases), verbose): case["id"]
+            for i, case in enumerate(cases)
+        }
+        for future in as_completed(futures):
+            case_id = futures[future]
+            case_result, case_tokens = future.result()
+            case_results_map[case_id] = (case_result, case_tokens)
 
-        case_tokens = empty_token_totals()
-
-        # Get agent response
-        response, agent_tokens = get_agent_response(prompt, case)
-        add_tokens(case_tokens, agent_tokens)
-        add_tokens(total_tokens, agent_tokens)
-
-        if verbose:
-            print(f"Response ({len(response.split())} words):")
-            print(f"  {response[:300]}...")
-            print(f"  tokens: in={agent_tokens['input_tokens']} out={agent_tokens['output_tokens']} cost=${agent_tokens['cost_usd']:.4f}")
-
-        # Judge each criterion
-        case_results = {"id": case["id"], "criteria": {}, "pass_count": 0}
-
-        for criterion in CRITERIA:
-            passed, judge_tokens = judge_response(case, response, criterion)
-            add_tokens(case_tokens, judge_tokens)
-            add_tokens(total_tokens, judge_tokens)
-            case_results["criteria"][criterion["id"]] = passed
+    # Reassemble in original order
+    for case in cases:
+        case_result, case_tokens = case_results_map[case["id"]]
+        add_tokens(total_tokens, case_tokens)
+        for cid, passed in case_result["criteria"].items():
             if passed:
-                case_results["pass_count"] += 1
-                results["criteria_scores"][criterion["id"]] += 1
+                results["criteria_scores"][cid] += 1
                 results["total_pass"] += 1
             results["total_checks"] += 1
-
-            if verbose:
-                status = "PASS" if passed else "FAIL"
-                print(f"  [{status}] {criterion['id']}")
-
-        case_results["token_usage"] = case_tokens
-        results["cases"].append(case_results)
+        results["cases"].append(case_result)
 
     # Compute final score
     results["pass_rate"] = round(
         results["total_pass"] / results["total_checks"], 4
     ) if results["total_checks"] > 0 else 0.0
     results["token_usage"] = total_tokens
+    results["wall_clock_s"] = round(time.time() - wall_start, 1)
 
     return results
 
@@ -240,6 +289,7 @@ def merge_batch_results() -> dict:
     total_pass = 0
     total_checks = 0
     total_tokens = empty_token_totals()
+    max_wall = 0.0
 
     for bf in batch_files:
         batch = json.loads(bf.read_text())
@@ -250,6 +300,7 @@ def merge_batch_results() -> dict:
         total_checks += batch["total_checks"]
         if batch.get("token_usage"):
             add_tokens(total_tokens, batch["token_usage"])
+        max_wall = max(max_wall, batch.get("wall_clock_s", 0))
 
     num_cases = len(all_cases)
     merged = {
@@ -266,6 +317,7 @@ def merge_batch_results() -> dict:
         "pass_rate": round(total_pass / total_checks, 4) if total_checks > 0 else 0.0,
         "batches_merged": len(batch_files),
         "token_usage": total_tokens,
+        "wall_clock_s": max_wall,
     }
     return merged
 
@@ -282,6 +334,8 @@ def print_summary(results: dict):
     print(f"Total:      {results['total_pass']}/{results['total_checks']}")
     if results.get("batches_merged"):
         print(f"Batches:    {results['batches_merged']} merged")
+    if results.get("wall_clock_s"):
+        print(f"Wall clock: {results['wall_clock_s']:.1f}s")
     print(f"")
     print(f"pass_rate: {results['pass_rate']}")
     print(f"")
@@ -345,7 +399,7 @@ if __name__ == "__main__":
         batch_num = int(sys.argv[idx + 1])
         cases = get_batch_cases(all_cases, batch_num)
         batch_id = f"batch_{batch_num}"
-        print(f"Running batch {batch_num}/5: {[c['id'] for c in cases]}")
+        print(f"Running batch {batch_num}: {[c['id'] for c in cases]}")
 
     # --cases id1,id2: run specific cases
     elif "--cases" in sys.argv:
@@ -362,8 +416,8 @@ if __name__ == "__main__":
         print("Running eval using Claude Code CLI (pre-authenticated)...")
 
     print(f"Agent model: {MODEL_AGENT} | Judge model: {MODEL_JUDGE}")
-    cli_calls = len(cases) * (1 + len(CRITERIA))
-    print(f"{len(cases)} cases x {len(CRITERIA)} criteria = {len(cases) * len(CRITERIA)} checks + {len(cases)} responses = {cli_calls} CLI calls")
+    cli_calls = len(cases) * 2  # 1 agent + 1 batched judge per case
+    print(f"{len(cases)} cases x (1 response + 1 batched judge) = {cli_calls} CLI calls")
     print("")
 
     results = run_eval(cases, verbose=verbose)
